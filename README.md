@@ -142,3 +142,12 @@ series = {MM '20}
 Acknowledgements
 ----------
 Parts of the code structure is inspired by this [TTS repository](https://github.com/r9y9/deepvoice3_pytorch). We thank the author for this wonderful code. The code for Face Detection has been taken from the [face_alignment](https://github.com/1adrianb/face-alignment) repository. We thank the authors for releasing their code and models.
+
+Microservice:
+```bash
+# build the docker image
+docker build -t wav2lip .
+
+# run the docker image sharing ports between host and container
+docker run -p 8000:8000 -it wav2lip:latest
+```

@@ -1,290 +1,363 @@
-from os import listdir, path
+import argparse
+import glob
+import importlib
+import os
+import re
+import subprocess
+import time
+
+import audio
+import cv2
 import numpy as np
-import scipy, cv2, os, sys, argparse, audio
-import json, subprocess, random, string
+import pyttsx3
+import torch
+from gtts import gTTS
+from helpers import device, load_model, datagen, mel_step_size
 from tqdm import tqdm
-from glob import glob
-import torch, face_detection
-from models import Wav2Lip
-import platform
+
+MAX_FILE_LENGTH = 250
+SRAVI_PHRASES = [
+    "What's the plan?",
+    "I feel depressed",
+    "Call my family",
+    "I'm hot",
+    "I'm cold",
+    "I feel anxious",
+    "What time is it?",
+    "I don't want that",
+    "How am I doing?",
+    "I need the bathroom",
+    "I'm comfortable",
+    "I'm thirsty",
+    "It's too bright",
+    "I'm in pain",
+    "Move me",
+    "It's too noisy",
+    "Doctor",
+    "I'm hungry",
+    "Can I have a cough?",
+    "I am scared"
+]
+ABS_FILE_PATH = os.path.abspath(__file__)
+DIR_NAME = os.path.dirname(ABS_FILE_PATH)
+TTS_SAVE_DIRECTORY = os.path.join(DIR_NAME, 'tts')
+VIDEO_SAVE_DIRECTORY = os.path.join(DIR_NAME, 'output_videos')
+for dir in [TTS_SAVE_DIRECTORY, VIDEO_SAVE_DIRECTORY]:
+    if not os.path.exists(dir):
+        os.makedirs(dir)
 
 
-def get_smoothened_boxes(boxes, T):
-	for i in range(len(boxes)):
-		if i + T > len(boxes):
-			window = boxes[len(boxes) - T:]
-		else:
-			window = boxes[i : i + T]
-		boxes[i] = np.mean(window, axis=0)
-	return boxes
+def phrase_to_output(phrase):
+    s = str(phrase).lower().strip().replace(' ', '_')
 
-def face_detect(args, images):
-	detector = face_detection.FaceAlignment(face_detection.LandmarksType._2D, 
-											flip_input=False, device=device)
+    return re.sub(r'[\?\!]', '', s)
 
-	batch_size = args.face_det_batch_size
-	
-	while 1:
-		predictions = []
-		try:
-			for i in tqdm(range(0, len(images), batch_size)):
-				predictions.extend(detector.get_detections_for_batch(np.array(images[i:i + batch_size])))
-		except RuntimeError:
-			if batch_size == 1: 
-				raise RuntimeError('Image too big to run face detection on GPU. Please use the --resize_factor argument')
-			batch_size //= 2
-			print('Recovering from OOM error; New batch size: {}'.format(batch_size))
-			continue
-		break
 
-	results = []
-	pady1, pady2, padx1, padx2 = args.pads
-	for rect, image in zip(predictions, images):
-		if rect is None:
-			cv2.imwrite('temp/faulty_frame.jpg', image) # check this frame where the face was not detected.
-			raise ValueError('Face not detected! Ensure the video contains a face in all the frames.')
+def shorten_filename(phrase):
+    return '_'.join([word[0] for word in phrase.split(' ')])
 
-		y1 = max(0, rect[1] - pady1)
-		y2 = min(image.shape[0], rect[3] + pady2)
-		x1 = max(0, rect[0] - padx1)
-		x2 = min(image.shape[1], rect[2] + padx2)
-		
-		results.append([x1, y1, x2, y2])
 
-	boxes = np.array(results)
-	if not args.nosmooth: boxes = get_smoothened_boxes(boxes, T=5)
-	results = [[image[y1: y2, x1:x2], (y1, y2, x1, x2)] for image, (x1, y1, x2, y2) in zip(images, boxes)]
+def generate_tts(phrases, gtts, rate):
+    for phrase in tqdm(phrases):
+        wav_output = os.path.join(TTS_SAVE_DIRECTORY,
+                                  f'{phrase_to_output(phrase)}.wav')
+        if len(wav_output) > MAX_FILE_LENGTH:
+            wav_output = os.path.join(TTS_SAVE_DIRECTORY,
+                                      f'{shorten_filename(phrase)}.wav')
+        if not os.path.exists(wav_output):
+            # print('Running TTS for:', phrase)
+            while not os.path.exists(wav_output):
+                try:
+                    if gtts:
+                        # use google translate
+                        tts = gTTS(phrase, lang='en')
+                        tts.save(wav_output.replace("'", "\\'"))
+                    else:
+                        # use linux tts
+                        importlib.reload(pyttsx3)
+                        engine = pyttsx3.init()
+                        engine.setProperty('rate', rate)
+                        engine.save_to_file(phrase, wav_output.replace("'", "\\'"))
+                        engine.runAndWait()
+                        engine.stop()
+                except Exception as e:
+                    print(phrase, 'TTS failed', e)
+                    os.remove(wav_output)
+                time.sleep(1)
 
-	del detector
-	return results 
 
-def datagen(args, frames, mels):
-	img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
+def get_video_rotation(video_path):
+    cmd = f'ffmpeg -i {video_path}'
 
-	if args.box[0] == -1:
-		if not args.static:
-			face_det_results = face_detect(args, frames) # BGR2RGB for CNN face detection
-		else:
-			face_det_results = face_detect(args, [frames[0]])
-	else:
-		print('Using the specified bounding box instead of face detection...')
-		y1, y2, x1, x2 = args.box
-		face_det_results = [[f[y1: y2, x1:x2], (y1, y2, x1, x2)] for f in frames]
+    p = subprocess.Popen(
+        cmd.split(' '),
+        stderr=subprocess.PIPE,
+        close_fds=True
+    )
+    stdout, stderr = p.communicate()
 
-	for i, m in enumerate(mels):
-		idx = 0 if args.static else i%len(frames)
-		frame_to_save = frames[idx].copy()
-		face, coords = face_det_results[idx].copy()
+    try:
+        reo_rotation = re.compile('rotate\s+:\s(\d+)')
+        match_rotation = reo_rotation.search(str(stderr))
+        rotation = match_rotation.groups()[0]
+    except AttributeError:
+        print(f'Rotation not found: {video_path}')
+        return 0
 
-		face = cv2.resize(face, (args.img_size, args.img_size))
-			
-		img_batch.append(face)
-		mel_batch.append(m)
-		frame_batch.append(frame_to_save)
-		coords_batch.append(coords)
+    return int(rotation)
 
-		if len(img_batch) >= args.wav2lip_batch_size:
-			img_batch, mel_batch = np.asarray(img_batch), np.asarray(mel_batch)
 
-			img_masked = img_batch.copy()
-			img_masked[:, args.img_size//2:] = 0
+def fix_frame_rotation(image, rotation):
+    if rotation == 90:
+        image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+    elif rotation == 180:
+        image = cv2.rotate(image, cv2.ROTATE_180)
+    elif rotation == 270:
+        image = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
-			img_batch = np.concatenate((img_masked, img_batch), axis=3) / 255.
-			mel_batch = np.reshape(mel_batch, [len(mel_batch), mel_batch.shape[1], mel_batch.shape[2], 1])
+    return image
 
-			yield img_batch, mel_batch, frame_batch, coords_batch
-			img_batch, mel_batch, frame_batch, coords_batch = [], [], [], []
 
-	if len(img_batch) > 0:
-		img_batch, mel_batch = np.asarray(img_batch), np.asarray(mel_batch)
+def generate_new_video(args, input_video, input_audio, output_file):
+    video_stream = cv2.VideoCapture(input_video)
+    fps = video_stream.get(cv2.CAP_PROP_FPS)
+    rotation = get_video_rotation(input_video)
 
-		img_masked = img_batch.copy()
-		img_masked[:, args.img_size//2:] = 0
+    print('Reading video frames...')
 
-		img_batch = np.concatenate((img_masked, img_batch), axis=3) / 255.
-		mel_batch = np.reshape(mel_batch, [len(mel_batch), mel_batch.shape[1], mel_batch.shape[2], 1])
+    full_frames = []
+    while 1:
+        still_reading, frame = video_stream.read()
+        if not still_reading:
+            video_stream.release()
+            break
+        if args.resize_factor > 1:
+            frame = cv2.resize(frame, (frame.shape[1] // args.resize_factor,
+                                       frame.shape[0] // args.resize_factor))
 
-		yield img_batch, mel_batch, frame_batch, coords_batch
+        frame = fix_frame_rotation(frame, rotation)
 
-mel_step_size = 16
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-print('Using {} for inference.'.format(device))
+        y1, y2, x1, x2 = args.crop
+        if x2 == -1: x2 = frame.shape[1]
+        if y2 == -1: y2 = frame.shape[0]
 
-def _load(checkpoint_path):
-	if device == 'cuda':
-		checkpoint = torch.load(checkpoint_path)
-	else:
-		checkpoint = torch.load(checkpoint_path,
-								map_location=lambda storage, loc: storage)
-	return checkpoint
+        frame = frame[y1:y2, x1:x2]
 
-def load_model(path):
-	model = Wav2Lip()
-	print("Load checkpoint from: {}".format(path))
-	checkpoint = _load(path)
-	s = checkpoint["state_dict"]
-	new_s = {}
-	for k, v in s.items():
-		new_s[k.replace('module.', '')] = v
-	model.load_state_dict(new_s)
+        full_frames.append(frame)
 
-	model = model.to(device)
-	return model.eval()
+    print("Number of frames available for inference: " + str(len(full_frames)))
 
-def main():
-	if not os.path.isfile(args.face):
-		raise ValueError('--face argument must be a valid path to video/image file')
+    if not input_audio.endswith('.wav'):
+        print('Extracting raw audio...')
+        command = "ffmpeg -y -i {} -strict -2 {}".format(input_audio,
+                                                         'temp/temp.wav')
 
-	elif args.face.split('.')[1] in ['jpg', 'png', 'jpeg']:
-		full_frames = [cv2.imread(args.face)]
-		fps = args.fps
+        subprocess.call(command, shell=True)
+        input_audio = 'temp/temp.wav'
 
-	else:
-		video_stream = cv2.VideoCapture(args.face)
-		fps = video_stream.get(cv2.CAP_PROP_FPS)
+    wav = audio.load_wav(input_audio, 16000)
+    mel = audio.melspectrogram(wav)
+    print(mel.shape)
 
-		print('Reading video frames...')
+    if np.isnan(mel.reshape(-1)).sum() > 0:
+        raise ValueError(
+            'Mel contains nan! Using a TTS voice? Add a small epsilon noise to the wav file and try again')
 
-		full_frames = []
-		while 1:
-			still_reading, frame = video_stream.read()
-			if not still_reading:
-				video_stream.release()
-				break
-			if args.resize_factor > 1:
-				frame = cv2.resize(frame, (frame.shape[1]//args.resize_factor, frame.shape[0]//args.resize_factor))
+    mel_chunks = []
+    mel_idx_multiplier = 80. / fps
+    i = 0
+    while 1:
+        start_idx = int(i * mel_idx_multiplier)
+        if start_idx + mel_step_size > len(mel[0]):
+            mel_chunks.append(mel[:, len(mel[0]) - mel_step_size:])
+            break
+        mel_chunks.append(mel[:, start_idx: start_idx + mel_step_size])
+        i += 1
 
-			if args.rotate:
-				frame = cv2.rotate(frame, cv2.cv2.ROTATE_90_CLOCKWISE)
+    print("Length of mel chunks: {}".format(len(mel_chunks)))
 
-			y1, y2, x1, x2 = args.crop
-			if x2 == -1: x2 = frame.shape[1]
-			if y2 == -1: y2 = frame.shape[0]
+    full_frames = full_frames[:len(mel_chunks)]
 
-			frame = frame[y1:y2, x1:x2]
+    batch_size = args.wav2lip_batch_size
+    gen = datagen(args, full_frames.copy(), mel_chunks)
 
-			full_frames.append(frame)
+    for i, (img_batch, mel_batch, frames, coords) in\
+            enumerate(tqdm(gen, total=int(np.ceil(float(len(mel_chunks)) / batch_size)))):
+        if i == 0:
+            model = load_model(args.checkpoint_path)
+            print("Model loaded")
 
-	print ("Number of frames available for inference: "+str(len(full_frames)))
+            frame_h, frame_w = full_frames[0].shape[:-1]
+            out = cv2.VideoWriter('temp/result.avi',
+                                  cv2.VideoWriter_fourcc(*'DIVX'), fps,
+                                  (frame_w, frame_h))
 
-	if not args.audio.endswith('.wav'):
-		print('Extracting raw audio...')
-		command = 'ffmpeg -y -i {} -strict -2 {}'.format(args.audio, 'temp/temp.wav')
+        img_batch = torch.FloatTensor(np.transpose(img_batch, (0, 3, 1, 2))).to(device)
+        mel_batch = torch.FloatTensor(np.transpose(mel_batch, (0, 3, 1, 2))).to(device)
 
-		subprocess.call(command, shell=True)
-		args.audio = 'temp/temp.wav'
+        with torch.no_grad():
+            pred = model(mel_batch, img_batch)
 
-	wav = audio.load_wav(args.audio, 16000)
-	mel = audio.melspectrogram(wav)
-	print(mel.shape)
+        pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.
 
-	if np.isnan(mel.reshape(-1)).sum() > 0:
-		raise ValueError('Mel contains nan! Using a TTS voice? Add a small epsilon noise to the wav file and try again')
+        for p, f, c in zip(pred, frames, coords):
+            y1, y2, x1, x2 = c
+            p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
 
-	mel_chunks = []
-	mel_idx_multiplier = 80./fps 
-	i = 0
-	while 1:
-		start_idx = int(i * mel_idx_multiplier)
-		if start_idx + mel_step_size > len(mel[0]):
-			mel_chunks.append(mel[:, len(mel[0]) - mel_step_size:])
-			break
-		mel_chunks.append(mel[:, start_idx : start_idx + mel_step_size])
-		i += 1
+            f[y1:y2, x1:x2] = p
+            out.write(f)
 
-	print("Length of mel chunks: {}".format(len(mel_chunks)))
+    out.release()
 
-	full_frames = full_frames[:len(mel_chunks)]
+    input_audio = input_audio.replace("'", "\\'")
+    output_file = output_file.replace("'", "\\'")
+    command = 'ffmpeg -y -i {} -i {} -strict -2 -q:v 1 {}'\
+        .format(input_audio, 'temp/result.avi', output_file)
+    print(command)
+    subprocess.call(command, shell=True)
 
-	batch_size = args.wav2lip_batch_size
-	gen = datagen(full_frames.copy(), mel_chunks)
 
-	for i, (img_batch, mel_batch, frames, coords) in enumerate(tqdm(gen, 
-											total=int(np.ceil(float(len(mel_chunks))/batch_size)))):
-		if i == 0:
-			model = load_model(args.checkpoint_path)
-			print ("Model loaded")
+def inference_directory(args):
+    args.img_size = 96
+    for video_path in glob.glob(os.path.join(args.videos_directory, '*.mp4')):
+        output_path = os.path.join('output_videos',
+                                   os.path.basename(video_path))
+        generate_new_video(
+            args,
+            input_video=video_path,
+            input_audio=video_path,
+            output_file=output_path
+        )
 
-			frame_h, frame_w = full_frames[0].shape[:-1]
-			out = cv2.VideoWriter('temp/result.avi', 
-									cv2.VideoWriter_fourcc(*'DIVX'), fps, (frame_w, frame_h))
 
-		img_batch = torch.FloatTensor(np.transpose(img_batch, (0, 3, 1, 2))).to(device)
-		mel_batch = torch.FloatTensor(np.transpose(mel_batch, (0, 3, 1, 2))).to(device)
+def inference_video(args):
+    args.img_size = 96
+    output_path = os.path.join('output_videos',
+                               os.path.basename(args.video_path))
+    generate_new_video(
+        args,
+        input_video=args.video_path,
+        input_audio=args.audio_path,
+        output_file=output_path
+    )
 
-		with torch.no_grad():
-			pred = model(mel_batch, img_batch)
 
-		pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.
-		
-		for p, f, c in zip(pred, frames, coords):
-			y1, y2, x1, x2 = c
-			p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
+def tts_inference(args):
+    args.img_size = 96
+    phrases = args.input_phrases if args.input_phrases else SRAVI_PHRASES
 
-			f[y1:y2, x1:x2] = p
-			out.write(f)
+    if args.tts:
+        generate_tts(phrases, args.gtts, args.rate)
 
-	out.release()
+    num_sessions = len(args.input_videos)
 
-	command = 'ffmpeg -y -i {} -i {} -strict -2 -q:v 1 {}'.format(args.audio, 'temp/result.avi', args.outfile)
-	subprocess.call(command, shell=platform.system() != 'Windows')
+    for session_number in range(num_sessions):
+        input_video_path = args.input_videos[session_number]
+        for phrase in phrases:
+            audio_input = \
+                os.path.join(TTS_SAVE_DIRECTORY,
+                             f'{phrase_to_output(phrase)}.wav')
+            if len(audio_input) > MAX_FILE_LENGTH:
+                audio_input = os.path.join(TTS_SAVE_DIRECTORY,
+                                           f'{shorten_filename(phrase)}.wav')
+
+            output_video_file = \
+                os.path.join(VIDEO_SAVE_DIRECTORY,
+                             f'{phrase_to_output(phrase)}_{session_number+1}.mp4')
+            if len(output_video_file) > MAX_FILE_LENGTH:
+                output_video_file = \
+                    os.path.join(VIDEO_SAVE_DIRECTORY,
+                                 f'{shorten_filename(phrase)}_{session_number+1}.mp4')
+
+            if os.path.exists(output_video_file):
+                continue
+            print('Generating new video:', output_video_file, audio_input)
+            generate_new_video(args, input_video_path, audio_input,
+                               output_video_file)
+            if not os.path.exists(output_video_file):
+                print(phrase, 'failed')
+                exit(1)
+
+            with open(os.path.join(VIDEO_SAVE_DIRECTORY, 'groundtruth.csv'),
+                      'a') as f:
+                f.write(f'{os.path.basename(output_video_file)},{phrase},{phrase}\n')
+
+
+def main(args):
+    f = {
+        'inference_directory': inference_directory,
+        'inference_video': inference_video,
+        'tts_inference': tts_inference,
+    }
+
+    if args.run_type not in f:
+        print('Choose between:', list(f.keys()))
+        exit()
+
+    f[args.run_type](args)
+
+
+def str_list(s):
+    return s.split(',')
+
+
+def file_list(s):
+    with open(s, 'r') as f:
+        return f.read().splitlines()
+
 
 if __name__ == '__main__':
-	parser = argparse.ArgumentParser(
-		description='Inference code to lip-sync videos in the wild using Wav2Lip models')
+    parser = argparse.ArgumentParser()
 
-	parser.add_argument('--checkpoint_path', type=str,
-						help='Name of saved checkpoint to load weights from',
-						required=True)
+    parser.add_argument('--checkpoint_path', type=str,
+                        help='Name of saved checkpoint to load weights from',
+                        required=True)
 
-	parser.add_argument('--face', type=str,
-						help='Filepath of video/image that contains faces to use',
-						required=True)
-	parser.add_argument('--audio', type=str,
-						help='Filepath of video/audio file to use as raw audio source',
-						required=True)
-	parser.add_argument('--outfile', type=str,
-						help='Video path to save result. See default for an e.g.',
-						default='results/result_voice.mp4')
+    parser.add_argument('--static', type=bool,
+                        help='If True, then use only first video frame for inference',
+                        default=False)
+    parser.add_argument('--fps', type=float,
+                        help='Can be specified only if input is a static image (default: 25)',
+                        default=25., required=False)
 
-	parser.add_argument('--static', type=bool,
-						help='If True, then use only first video frame for inference',
-						default=False)
-	parser.add_argument('--fps', type=float,
-						help='Can be specified only if input is a static image (default: 25)',
-						default=25., required=False)
+    parser.add_argument('--pads', nargs='+', type=int, default=[0, 10, 0, 0],
+                        help='Padding (top, bottom, left, right). Please adjust to include chin at least')
 
-	parser.add_argument('--pads', nargs='+', type=int, default=[0, 10, 0, 0],
-						help='Padding (top, bottom, left, right). Please adjust to include chin at least')
+    parser.add_argument('--face_det_batch_size', type=int,
+                        help='Batch size for face detection', default=16)
+    parser.add_argument('--wav2lip_batch_size', type=int,
+                        help='Batch size for Wav2Lip model(s)', default=128)
 
-	parser.add_argument('--face_det_batch_size', type=int,
-						help='Batch size for face detection', default=16)
-	parser.add_argument('--wav2lip_batch_size', type=int,
-						help='Batch size for Wav2Lip model(s)', default=128)
+    parser.add_argument('--resize_factor', default=1, type=int,
+                        help='Reduce the resolution by this factor. Sometimes, best results are obtained at 480p or 720p')
 
-	parser.add_argument('--resize_factor', default=1, type=int,
-						help='Reduce the resolution by this factor. Sometimes, best results are obtained at 480p or 720p')
+    parser.add_argument('--crop', nargs='+', type=int, default=[0, -1, 0, -1],
+                        help='Crop video to a smaller region (top, bottom, left, right). Applied after resize_factor and rotate arg. '
+                             'Useful if multiple face present. -1 implies the value will be auto-inferred based on height, width')
 
-	parser.add_argument('--crop', nargs='+', type=int, default=[0, -1, 0, -1],
-						help='Crop video to a smaller region (top, bottom, left, right). Applied after resize_factor and rotate arg. '
-							 'Useful if multiple face present. -1 implies the value will be auto-inferred based on height, width')
+    parser.add_argument('--box', nargs='+', type=int, default=[-1, -1, -1, -1],
+                        help='Specify a constant bounding box for the face. Use only as a last resort if the face is not detected.'
+                             'Also, might work only if the face is not moving around much. Syntax: (top, bottom, left, right).')
 
-	parser.add_argument('--box', nargs='+', type=int, default=[-1, -1, -1, -1],
-						help='Specify a constant bounding box for the face. Use only as a last resort if the face is not detected.'
-							 'Also, might work only if the face is not moving around much. Syntax: (top, bottom, left, right).')
+    parser.add_argument('--nosmooth', default=False, action='store_true',
+                        help='Prevent smoothing face detections over a short temporal window')
 
-	parser.add_argument('--rotate', default=False, action='store_true',
-						help='Sometimes videos taken from a phone can be flipped 90deg. If true, will flip video right by 90deg.'
-							 'Use if you get a flipped result, despite feeding a normal looking video')
+    sub_parsers = parser.add_subparsers(dest='run_type')
 
-	parser.add_argument('--nosmooth', default=False, action='store_true',
-						help='Prevent smoothing face detections over a short temporal window')
+    parser_1 = sub_parsers.add_parser('inference_directory')
+    parser_1.add_argument('videos_directory')
 
-	args = parser.parse_args()
-	args.img_size = 96
+    parser_2 = sub_parsers.add_parser('inference_video')
+    parser_2.add_argument('video_path')
+    parser_2.add_argument('audio_path')
 
-	if os.path.isfile(args.face) and args.face.split('.')[1] in ['jpg', 'png',
-																 'jpeg']:
-		args.static = True
+    parser_2 = sub_parsers.add_parser('tts_inference')
+    parser_2.add_argument('input_videos', type=str_list)
+    parser_2.add_argument('--input_phrases', type=file_list, default=None)
+    parser_2.add_argument('--tts', action='store_true')
+    parser_2.add_argument('--gtts', action='store_true')
+    parser_2.add_argument('--rate', type=int, default=180)  # lower = slower
 
-	main()
+    parser_3 = sub_parsers.add_parser('server')
+
+    main(parser.parse_args())
